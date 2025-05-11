@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import sys
-import math
-import xml.etree.ElementTree as ET
-import requests
-import svgwrite
-import json
-from shapely.geometry import Point, Polygon, LineString
-from pykml import parser
-from lxml import etree
+"""
+KML to SVG Converter
 
-def parse_kml(kml_file):
+This script converts KML files to SVG maps with additional features from OpenStreetMap data.
+This is now a wrapper around the modular implementation for backward compatibility.
+"""
+
+import sys
+
+# Import functions from the modular implementation
+from kml_parser import parse_kml
+from geo_utils import get_bounding_box
+from osm_data import download_osm_data
+from svg_generator import create_svg_map
+
+# The original functions are kept here as documentation but not used
+def _original_parse_kml(kml_file):
     """Extraire un polygone à partir d'un fichier KML."""
     with open(kml_file, 'rb') as f:
         tree = parser.parse(f)
@@ -108,6 +113,7 @@ def download_osm_data(bbox):
     (
         // Get allotments and paths in the immediate area
         way["landuse"="allotment"]({min_lat},{min_lon},{max_lat},{max_lon});
+        way["landuse"="allotments"]({min_lat},{min_lon},{max_lat},{max_lon});  // Add plural form
         way["highway"="footway"]({min_lat},{min_lon},{max_lat},{max_lon});
         way["highway"="path"]({min_lat},{min_lon},{max_lat},{max_lon});
         way["highway"="pedestrian"]({min_lat},{min_lon},{max_lat},{max_lon});
@@ -148,9 +154,30 @@ def is_line_in_boundary(points, boundary_coords):
     """Vérifie si une ligne est à l'intérieur du polygone de la frontière."""
     if not boundary_coords:
         return True
-    polygon = Polygon(boundary_coords)
-    line = LineString(points)
-    return polygon.intersects(line)
+    try:
+        polygon = Polygon(boundary_coords)
+        shape = Polygon(points) if len(points) > 2 else LineString(points)
+        
+        # Create a small buffer around both the polygon and the shape
+        buffered_polygon = polygon.buffer(0.0002)  # About 22 meters at this latitude
+        buffered_shape = shape.buffer(0.0002)
+        
+        # Check for intersection between the buffered geometries
+        intersects = buffered_polygon.intersects(buffered_shape)
+        
+        # For potential allotments (anything between 2.179-2.181, 48.944-48.946), print debug info
+        if any(2.179 <= p[0] <= 2.181 and 48.944 <= p[1] <= 48.946 for p in points):
+            print(f"Boundary test for feature near allotment area:")
+            print(f"- Points: {points[:2]}...")
+            print(f"- Intersects with boundary: {intersects}")
+            print(f"- Shape type: {'Polygon' if len(points) > 2 else 'LineString'}")
+            print(f"- Area overlaps: {buffered_polygon.intersection(buffered_shape).area > 0}")
+        
+        return intersects
+        
+    except Exception as e:
+        print(f"Warning: Boundary test failed: {e}")
+        return True  # If test fails, include the feature rather than exclude it
 
 def get_way_style(tags, is_inside=True):
     """Détermine le style de rendu en fonction des tags OSM et de la position."""
@@ -235,12 +262,12 @@ def get_way_style(tags, is_inside=True):
         }
     
     elif any(tag in tags for tag in ["leisure", "landuse", "natural"]):
-        if tags.get("landuse") == "allotment":
+        if tags.get("landuse") in ["allotment", "allotments"]:  # Handle both singular and plural
             base_style = {
                 "fill": "#E8F4D9",  # Vert pâle pour les jardins/allotments
-                "stroke": "#D6E6C3",  # Contour plus foncé
-                "stroke-width": 1,
-                "opacity": 0.7,
+                "stroke": "#76A32D",  # Contour plus foncé et plus visible
+                "stroke-width": 2,    # Border plus épais
+                "opacity": 0.9,       # Opacité augmentée
                 "type": "polygon"
             }
         elif tags.get("leisure") in ["park", "garden"] or tags.get("landuse") == "grass":
@@ -274,12 +301,8 @@ def get_way_style(tags, is_inside=True):
     return base_style
 
 def lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height):
-    """Convert geographic coordinates to SVG coordinates."""
+    """Convert geographic coordinates to SVG coordinates with improved aspect ratio handling."""
     min_lon, min_lat, max_lon, max_lat = bbox
-    
-    # Validate input coordinates
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-        print(f"Warning: Potentially invalid coordinates: lat={lat}, lon={lon}")
     
     # Calculate width/height ratio to maintain proportions
     lon_range = max_lon - min_lon
@@ -288,363 +311,324 @@ def lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height):
     if lon_range == 0 or lat_range == 0:
         raise ValueError("Invalid bounding box dimensions: zero range")
     
-    try:
-        x = (lon - min_lon) / lon_range * svg_width
-        y = (1 - (lat - min_lat) / lat_range) * svg_height
-        return x, y
-    except Exception as e:
-        print(f"Error converting coordinates: lat={lat}, lon={lon}, bbox={bbox}")
-        raise ValueError(f"Error converting coordinates: {str(e)}")
+    # Add padding to prevent features from touching the edges
+    padding = 0.05  # 5% padding
+    effective_width = svg_width * (1 - 2 * padding)
+    effective_height = svg_height * (1 - 2 * padding)
+    
+    # Calculate scales that would preserve the aspect ratio in both directions
+    scale_x = effective_width / lon_range
+    scale_y = effective_height / lat_range
+    
+    # Use the smaller scale to ensure the map fits in both dimensions
+    scale = min(scale_x, scale_y)
+    
+    # Calculate centered offsets
+    x_offset = (svg_width - (lon_range * scale)) / 2
+    y_offset = (svg_height - (lat_range * scale)) / 2
+    
+    # Transform coordinates
+    x = x_offset + (lon - min_lon) * scale
+    y = y_offset + (max_lat - lat) * scale  # Invert Y axis
+    
+    print(f"Transformed coordinates: ({lon}, {lat}) -> ({x}, {y})")
+    return x, y
 
-def calculate_road_segments(way_nodes, bbox, svg_width, svg_height):
-    """Calculate road segments and their angles in SVG coordinates."""
-    if len(way_nodes) < 2:
-        return 0, [], None
-    
-    # Convert geographic coordinates to SVG coordinates
-    points = []
-    for lon, lat in way_nodes:
-        x, y = lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height)
-        points.append((x, y))
-    
-    # Calculate the middle segment
-    mid_idx = len(points) // 2
-    if mid_idx > 0:
-        # Use the segment containing the midpoint for angle calculation
-        start = points[mid_idx - 1]
-        end = points[mid_idx]
-        dx = end[0] - start[0]
-        dy = end[1] - start[1]
-        angle = math.degrees(math.atan2(dy, dx))
-        
-        # Normalize angle to -90 to 90 degrees to avoid upside-down text
-        if angle < -90:
-            angle += 180
-        elif angle > 90:
-            angle -= 180
-        
-        return angle, points, points[mid_idx]
-    
-    return 0, points, points[0]
+def calculate_label_corners(x, y, width, height, angle, buffer=5):
+    """Calculate label corners with buffer."""
+    cos_a = math.cos(math.radians(angle))
+    sin_a = math.sin(math.radians(angle))
+    w2 = (width/2 + buffer)
+    h2 = (height/2 + buffer)
+    return [
+        (x - w2*cos_a + h2*sin_a, y - w2*sin_a - h2*cos_a),
+        (x + w2*cos_a + h2*sin_a, y + w2*sin_a - h2*cos_a),
+        (x + w2*cos_a - h2*sin_a, y + w2*sin_a + h2*cos_a),
+        (x - w2*cos_a - h2*sin_a, y - w2*sin_a + h2*cos_a)
+    ]
 
 def project_point_to_line(point, line_start, line_end):
     """Project a point onto a line segment, returning the projected point."""
     px, py = point
     ax, ay = line_start
     bx, by = line_end
-    
-    # Vector from line start to point
     apx = px - ax
     apy = py - ay
-    
-    # Vector from line start to line end
     abx = bx - ax
     aby = by - ay
-    
-    # Length of line squared
     ab2 = abx * abx + aby * aby
-    
     if ab2 == 0:
         return line_start
-    
-    # Normalized dot product to get projection ratio
     t = max(0, min(1, (apx * abx + apy * aby) / ab2))
-    
     return (ax + t * abx, ay + t * aby)
-
-def find_road_center_in_boundary(way_nodes, boundary_coords, bbox, svg_width, svg_height):
-    """Find the best center point for road label within the boundary."""
-    if len(way_nodes) < 2:
-        return None, 0, None
-    
-    # Convert all points to SVG coordinates and geographic points
-    svg_points = []
-    geo_points = []
-    for lon, lat in way_nodes:
-        x, y = lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height)
-        svg_points.append((x, y))
-        geo_points.append((lon, lat))
-    
-    # Create boundary polygon and road line
-    boundary_poly = Polygon(boundary_coords)
-    road_line = LineString(geo_points)
-    
-    # Get the intersection with the boundary
-    if boundary_poly.intersects(road_line):
-        intersection = boundary_poly.intersection(road_line)
-        
-        # Get the center point of the intersection
-        center_geo = list(intersection.centroid.coords)[0]
-        center_x, center_y = lat_lon_to_xy(center_geo[1], center_geo[0], bbox, svg_width, svg_height)
-        center_point = (center_x, center_y)
-        
-        # Find the segment that's closest to the center point
-        min_dist = float('inf')
-        best_segment = None
-        projected_point = None
-        
-        for i in range(len(svg_points) - 1):
-            p1, p2 = svg_points[i], svg_points[i + 1]
-            
-            # Project center point onto this segment
-            proj = project_point_to_line(center_point, p1, p2)
-            
-            # Calculate distance from center to projection
-            dist = ((center_x - proj[0])**2 + (center_y - proj[1])**2)**0.5
-            
-            if dist < min_dist:
-                min_dist = dist
-                best_segment = (p1, p2)
-                projected_point = proj
-        
-        if best_segment and projected_point:
-            # Calculate angle from the best segment
-            dx = best_segment[1][0] - best_segment[0][0]
-            dy = best_segment[1][1] - best_segment[0][1]
-            angle = math.degrees(math.atan2(dy, dx))
-            
-            # Normalize angle to -90 to 90 degrees
-            if angle < -90:
-                angle += 180
-            elif angle > 90:
-                angle -= 180
-            
-            return projected_point, angle, best_segment
-    
-    return None, 0, None
 
 def create_svg_map(osm_data, boundary_coords, output_file, svg_width=800, svg_height=600):
     """Crée un fichier SVG de la carte."""
-    root = ET.fromstring(osm_data)
-    
-    # Extraire les nœuds et les chemins
-    nodes = {}
-    ways = []
-    
-    # Collecter tous les nœuds
-    for node in root.findall(".//node"):
-        node_id = node.get("id")
-        lat = float(node.get("lat"))
-        lon = float(node.get("lon"))
-        nodes[node_id] = (lon, lat)
-    
-    # Collecter tous les ways et leurs tags
-    for way in root.findall(".//way"):
-        way_id = way.get("id")
-        way_nodes = []
-        tags = {}
-        
-        for tag in way.findall("./tag"):
-            k = tag.get("k")
-            v = tag.get("v")
-            tags[k] = v
-        
-        for nd in way.findall("./nd"):
-            ref = nd.get("ref")
-            if ref in nodes:
-                way_nodes.append(nodes[ref])
-        
-        if way_nodes:
-            # Only add ways that are inside or intersect with boundary
-            if is_line_in_boundary(way_nodes, boundary_coords):
-                ways.append((way_nodes, tags))
-
-    # Calculer la boîte englobante
     bbox = get_bounding_box(boundary_coords)
     
-    # Créer le SVG
-    dwg = svgwrite.Drawing(output_file, profile='tiny', size=(svg_width, svg_height))
+    # Initialize SVG with white background
+    dwg = svgwrite.Drawing(output_file, (svg_width, svg_height))
+    dwg.add(dwg.rect(insert=(0, 0), size=(svg_width, svg_height), fill='white'))
     
-    # Créer les groupes pour les différentes couches
-    background_group = dwg.g(id="background")
-    water_group = dwg.g(id="water")
-    landuse_group = dwg.g(id="landuse")
-    buildings_group = dwg.g(id="buildings")
-    road_casings_group = dwg.g(id="road-casings")
-    roads_group = dwg.g(id="roads")
-    boundary_group = dwg.g(id="boundary")  # New group for KML boundary
-    labels_group = dwg.g(id="labels")
+    # Create groups for different layers
+    natural_group = dwg.g(id='natural-features')
+    landuse_group = dwg.g(id='landuse')
+    building_group = dwg.g(id='buildings')
+    road_group = dwg.g(id='roads')
+    path_group = dwg.g(id='paths')
+    parking_group = dwg.g(id='parking')  # New group for parking
+    text_group = dwg.g(id='text')
     
-    # Fond blanc
-    background_group.add(dwg.rect(insert=(0, 0), size=(svg_width, svg_height), fill='#F5F5F5'))
-    
-    # Trier les ways par type pour un rendu correct
-    ways.sort(key=lambda x: (
-        "highway" in x[1],  # Routes en dernier
-        "building" in x[1],  # Bâtiments avant les routes
-        "waterway" in x[1] or "natural" == "water",  # Eau en premier
-        "landuse" in x[1] or "leisure" in x[1]  # Utilisation des terres après l'eau
-    ))
-    
-    # Dessiner tous les ways avec leurs styles appropriés
-    for way_nodes, tags in ways:
-        style = get_way_style(tags, True)  # Always true since we filtered earlier
-        
-        if style:
-            points = [lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height) 
-                     for lon, lat in way_nodes]
-            
-            if style.get("type") == "road":
-                if style.get("casing"):
-                    casing = dwg.polyline(
-                        points=points,
-                        fill="none",
-                        stroke=style["casing-color"],
-                        stroke_width=style["casing-width"],
-                        stroke_linecap="round",
-                        stroke_linejoin="round",
-                        opacity=style["opacity"]
-                    )
-                    road_casings_group.add(casing)
-                
-                road = dwg.polyline(
-                    points=points,
-                    fill="none",
-                    stroke=style["stroke"],
-                    stroke_width=style["stroke-width"],
-                    stroke_linecap="round",
-                    stroke_linejoin="round",
-                    opacity=style["opacity"]
-                )
-                roads_group.add(road)
-            
-            elif style.get("type") == "polygon":
-                polygon = dwg.polygon(
-                    points=points,
-                    fill=style["fill"],
-                    stroke=style["stroke"],
-                    stroke_width=style["stroke-width"],
-                    opacity=style["opacity"]
-                )
-                
-                if style.get("symbol") == "P":
-                    # Calculate center point for parking symbol
-                    center_x = sum(p[0] for p in points) / len(points)
-                    center_y = sum(p[1] for p in points) / len(points)
-                    
-                    # Add parking symbol
-                    parking_symbol = dwg.text(
-                        "P",
-                        insert=(center_x, center_y + 4),
-                        font_size=12,
-                        font_family="Arial",
-                        font_weight="bold",
-                        fill="#666666",
-                        text_anchor="middle"
-                    )
-                    labels_group.add(parking_symbol)
-                
-                if "building" in tags:
-                    buildings_group.add(polygon)
-                elif "waterway" in tags or tags.get("natural") == "water":
-                    water_group.add(polygon)
-                else:
-                    landuse_group.add(polygon)
-    
-    # First, collect all segments for each road
-    road_segments = {}
-    for way_nodes, tags in ways:
-        if "name" in tags and "highway" in tags:
-            road_name = tags["name"]
-            highway_type = tags["highway"]
-            
-            if road_name not in road_segments:
-                road_segments[road_name] = {
-                    'segments': [],
-                    'highway_type': highway_type,
-                    'priority': 1 if highway_type in ["motorway", "trunk", "primary"] else (
-                        2 if highway_type in ["secondary", "tertiary"] else 3
-                    )
-                }
-            
-            road_segments[road_name]['segments'].extend(way_nodes)
-    
-    # Now process each road as a whole
-    names_dict = {}
-    for road_name, road_info in road_segments.items():
-        if road_info['segments']:
-            # Find center point for the entire road
-            center_point, angle, segment = find_road_center_in_boundary(
-                road_info['segments'], boundary_coords, bbox, svg_width, svg_height
-            )
-            
-            if center_point:
-                names_dict[road_name] = {
-                    'name': road_name,
-                    'highway_type': road_info['highway_type'],
-                    'priority': road_info['priority'],
-                    'angle': angle,
-                    'center': center_point,
-                    'segment': segment
-                }
+    # Initialize set to track added street names
+    added_names = set()
 
-    # Convert dictionary to list and sort by priority
-    names = sorted(names_dict.values(), key=lambda x: x['priority'])
+    # Parse XML
+    root = ET.fromstring(osm_data)
+    nodes = {n.attrib['id']: (float(n.attrib['lat']), float(n.attrib['lon'])) 
+             for n in root.findall('node')}
     
-    # Add road names
-    for name_info in names:
-        x, y = name_info['center']
-        angle = name_info['angle']
-        
-        font_size = 10 if name_info['highway_type'] in ["motorway", "trunk", "primary"] else (
-            8 if name_info['highway_type'] in ["secondary", "tertiary"] else 7
-        )
-        
-        # Create rotation transform with correct y-coordinate
-        transform = f"rotate({angle}, {x}, {y})"
-        
-        text_bg = dwg.text(
-            name_info['name'],
-            insert=(x, y),
-            font_size=font_size,
-            font_family="Arial",
-            fill="white",
-            stroke="white",
-            stroke_width=3,
-            text_anchor="middle",
-            transform=transform
-        )
-        
-        text = dwg.text(
-            name_info['name'],
-            insert=(x, y),
-            font_size=font_size,
-            font_family="Arial",
-            fill="#404040",
-            text_anchor="middle",
-            transform=transform
-        )
-        
-        labels_group.add(text_bg)
-        labels_group.add(text)
+    # Collection pour regrouper les segments de routes par nom
+    roads_by_name = {}
+    
+    # Premier passage : collecter toutes les routes
+    for way in root.findall('way'):
+        way_nodes = []
+        tags = {tag.attrib['k']: tag.attrib['v'] for tag in way.findall('tag')}
+        road_name = tags.get('name')
+        if 'highway' in tags and road_name:
+            # Get coordinates for way
+            for nd in way.findall('nd'):
+                if nd.attrib['ref'] in nodes:
+                    lat, lon = nodes[nd.attrib['ref']]
+                    way_nodes.append((lon, lat))
+            
+            if way_nodes:
+                if road_name not in roads_by_name:
+                    roads_by_name[road_name] = {'segments': [], 'tags': tags, 'inside_segments': []}
+                
+                # Check if this segment is inside the boundary
+                is_inside = is_line_in_boundary(way_nodes, boundary_coords)
+                roads_by_name[road_name]['segments'].append(way_nodes)
+                if is_inside:
+                    roads_by_name[road_name]['inside_segments'].append(way_nodes)
+    
+    # Track label positions to prevent overlaps
+    used_label_areas = []
+    
+    def check_label_collision(x, y, width, height, angle, buffer_distance=20):
+        """Check if a label area collides with existing labels, with increased buffer"""
+        # Create points for the four corners of the label area with buffer
+        cos_a = math.cos(math.radians(angle))
+        sin_a = math.sin(math.radians(angle))
+        w2 = (width/2 + buffer_distance)
+        h2 = (height/2 + buffer_distance)
+        corners = [
+            (x - w2*cos_a + h2*sin_a, y - w2*sin_a - h2*cos_a),
+            (x + w2*cos_a + h2*sin_a, y + w2*sin_a - h2*cos_a),
+            (x + w2*cos_a - h2*sin_a, y + w2*sin_a + h2*cos_a),
+            (x - w2*cos_a - h2*sin_a, y - w2*sin_a + h2*cos_a)
+        ]
+        new_box = Polygon(corners)
 
-    # Draw KML boundary with black border
-    boundary_points = [lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height) 
-                      for lon, lat in boundary_coords]
-    boundary = dwg.polygon(
-        points=boundary_points,
-        fill="none",
-        stroke="black",
-        stroke_width=2,
-        opacity=1
-    )
-    boundary_group.add(boundary)
+        # Check collision with existing labels
+        for existing_area in used_label_areas:
+            if new_box.intersects(existing_area):
+                return True
+        return False
+
+    # Ajouter les noms de rues pour tous les segments qui croisent la zone (pas seulement ceux entièrement à l'intérieur)
+    for road_name, road_data in roads_by_name.items():
+        if not road_data['segments']:
+            continue
+        
+        # Merge all segments (not just inside ones)
+        all_lines = [LineString(seg) for seg in road_data['segments'] if len(seg) > 1]
+        if not all_lines:
+            continue
+        
+        merged = linemerge(all_lines)
+        
+        # Clip to KML boundary with a buffer to ensure roads that touch the boundary are included
+        boundary_poly = Polygon(boundary_coords).buffer(0.0005)  # Add small buffer
+        
+        if merged.is_empty:
+            continue
+            
+        if merged.geom_type == 'MultiLineString':
+            # Instead of taking just the longest segment, try to label each major segment
+            segments_to_label = []
+            for line in merged.geoms:
+                if line.length > 0.0005:  # Only label segments of reasonable length
+                    clipped = line.intersection(boundary_poly)
+                    if not clipped.is_empty and clipped.length > 0:
+                        segments_to_label.append(clipped)
+        else:
+            clipped = merged.intersection(boundary_poly)
+            if not clipped.is_empty and clipped.length > 0:
+                segments_to_label = [clipped]
+        
+        if not segments_to_label:
+            continue
+            
+        # Try to label each segment
+        for i, clipped in enumerate(segments_to_label):
+            if clipped.is_empty or clipped.length == 0:
+                continue
+                
+            # Skip if this is a repeat segment and we already labeled this road
+            # Only allow multiple labels for the same road if they're sufficiently far apart
+            if road_name in added_names and i > 0 and len(segments_to_label) < 3:
+                continue
+                
+            # Find center point of clipped line
+            center_geo = list(clipped.interpolate(0.5, normalized=True).coords)[0]
+            center_x, center_y = lat_lon_to_xy(center_geo[1], center_geo[0], bbox, svg_width, svg_height)
+            
+            # Find angle at center
+            if clipped.geom_type == 'LineString':
+                svg_points = [lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height) for lon, lat in clipped.coords]
+            else:
+                # Handle other geometry types if needed
+                continue
+                
+            min_dist = float('inf')
+            best_angle = 0
+            
+            for i in range(len(svg_points) - 1):
+                p1, p2 = svg_points[i], svg_points[i + 1]
+                proj = project_point_to_line((center_x, center_y), p1, p2)
+                dist = ((center_x - proj[0])**2 + (center_y - proj[1])**2)**0.5
+                if dist < min_dist:
+                    min_dist = dist
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    angle = math.degrees(math.atan2(dy, dx))
+                    if angle < -90 or angle > 90:
+                        dx = -dx
+                        dy = -dy
+                        angle = math.degrees(math.atan2(dy, dx))
+                    best_angle = angle
+            
+            text_width = len(road_name) * 6
+            text_height = 12
+            
+            # Try multiple positions along the road if center position has collision
+            positions_to_try = [0.5, 0.3, 0.7, 0.2, 0.8]
+            
+            for pos in positions_to_try:
+                alt_center_geo = list(clipped.interpolate(pos, normalized=True).coords)[0]
+                alt_center_x, alt_center_y = lat_lon_to_xy(alt_center_geo[1], alt_center_geo[0], bbox, svg_width, svg_height)
+                
+                if not check_label_collision(alt_center_x, alt_center_y, text_width, text_height, best_angle):
+                    text = dwg.text(road_name)
+                    text['x'] = alt_center_x
+                    text['y'] = alt_center_y
+                    text['font-family'] = 'Arial, sans-serif'
+                    text['font-size'] = '12px'
+                    text['text-anchor'] = 'middle'
+                    text['fill'] = '#333333'
+                    if best_angle != 0:
+                        text['transform'] = f'rotate({best_angle} {alt_center_x} {alt_center_y})'
+                    text_group.add(text)
+                    corners = calculate_label_corners(alt_center_x, alt_center_y, text_width, text_height, best_angle)
+                    used_label_areas.append(Polygon(corners))
+                    added_names.add(road_name)
+                    break  # Found a good position, stop trying
+
+    # Process ways for drawing roads and other features
+    for way in root.findall('way'):
+        way_nodes = []
+        tags = {tag.attrib['k']: tag.attrib['v'] for tag in way.findall('tag')}
+        
+        for nd in way.findall('nd'):
+            if nd.attrib['ref'] in nodes:
+                lat, lon = nodes[nd.attrib['ref']]
+                way_nodes.append((lon, lat))
+        
+        if not way_nodes:
+            continue
+            
+        is_inside = is_line_in_boundary(way_nodes, boundary_coords)
+        style = get_way_style(tags, is_inside)
+        if not style:
+            continue
+            
+        svg_points = []
+        for lon, lat in way_nodes:
+            x, y = lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height)
+            svg_points.append((x, y))
+            
+        if len(svg_points) < 2:
+            continue
+            
+        if style.get('type') == 'road':
+            if style.get('casing'):
+                path = dwg.path(d=f'M {svg_points[0][0]},{svg_points[0][1]}')
+                for x, y in svg_points[1:]:
+                    path.push(f'L {x},{y}')
+                path['stroke'] = style.get('casing-color', '#000000')
+                path['stroke-width'] = style.get('casing-width', 1)
+                path['fill'] = 'none'
+                road_group.add(path)
+            
+            path = dwg.path(d=f'M {svg_points[0][0]},{svg_points[0][1]}')
+            for x, y in svg_points[1:]:
+                path.push(f'L {x},{y}')
+            path['stroke'] = style.get('stroke', '#000000')
+            path['stroke-width'] = style.get('stroke-width', 1)
+            path['fill'] = 'none'
+            path['stroke-opacity'] = style.get('opacity', 1)
+            
+            if style.get('is_path'):
+                path_group.add(path)
+            else:
+                road_group.add(path)
+                
+        elif style.get('type') == 'polygon':
+            poly_path = f'M {svg_points[0][0]},{svg_points[0][1]}'
+            for x, y in svg_points[1:]:
+                poly_path += f' L {x},{y}'
+            poly_path += ' Z'
+            
+            path = dwg.path(d=poly_path)
+            path['fill'] = style.get('fill', '#000000')
+            path['stroke'] = style.get('stroke', 'none')
+            path['stroke-width'] = style.get('stroke-width', 1)
+            path['fill-opacity'] = style.get('opacity', 1)
+            path['stroke-opacity'] = style.get('opacity', 1)
+            
+            if 'natural' in tags or tags.get('waterway'):
+                natural_group.add(path)
+            elif 'landuse' in tags or 'leisure' in tags:
+                landuse_group.add(path)
+            elif 'building' in tags:
+                building_group.add(path)
+            elif tags.get('amenity') == 'parking':
+                parking_group.add(path)
+                # Add parking symbol
+                center_x = sum(p[0] for p in svg_points) / len(svg_points)
+                center_y = sum(p[1] for p in svg_points) / len(svg_points)
+                parking_text = dwg.text("P", insert=(center_x, center_y))
+                parking_text['font-family'] = 'Arial, sans-serif'
+                parking_text['font-size'] = '14px'
+                parking_text['text-anchor'] = 'middle'
+                parking_text['dominant-baseline'] = 'middle'
+                parking_text['font-weight'] = 'bold'
+                parking_text['fill'] = '#666666'
+                parking_group.add(parking_text)
     
-    # Ajouter les groupes dans l'ordre correct
-    dwg.add(background_group)
-    dwg.add(water_group)
+    # Add groups to SVG in correct order
+    dwg.add(natural_group)
     dwg.add(landuse_group)
-    dwg.add(buildings_group)
-    dwg.add(road_casings_group)
-    dwg.add(roads_group)
-    dwg.add(boundary_group)  # Add boundary after roads but before labels
-    dwg.add(labels_group)
-    
-    # Sauvegarder le SVG
+    dwg.add(parking_group)  # Add parking before buildings
+    dwg.add(building_group)
+    dwg.add(road_group)
+    dwg.add(path_group)
+    dwg.add(text_group)
+      # Save the SVG file
     dwg.save()
-    print(f"Carte SVG générée avec succès: {output_file}")
 
-def main():
+def _original_main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Générateur de carte SVG à partir d'un fichier KML")
@@ -671,6 +655,44 @@ def main():
         
     except Exception as e:
         print(f"Erreur: {e}")
+        sys.exit(1)
+
+def main():
+    """
+    New main function that uses the modular implementation.
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="SVG Map Generator from KML files")
+    parser.add_argument("-k", "--kml", required=True, help="Path to input KML file")
+    parser.add_argument("-o", "--output", default="carte_generee.svg", help="Path to output SVG file (default: carte_generee.svg)")
+    
+    args = parser.parse_args()
+    
+    kml_file = args.kml
+    output_file = args.output
+    
+    try:
+        # Extract polygon from KML file
+        print(f"Parsing KML file: {kml_file}")
+        boundary_coords = parse_kml(kml_file)
+        
+        # Calculate bounding box
+        print("Calculating bounding box...")
+        bbox = get_bounding_box(boundary_coords)
+        
+        # Download OSM data
+        print("Downloading or retrieving cached OSM data...")
+        osm_data = download_osm_data(bbox)
+        
+        # Create SVG
+        print(f"Generating SVG map: {output_file}")
+        create_svg_map(osm_data, boundary_coords, output_file)
+        
+        print(f"SVG map created successfully: {output_file}")
+        
+    except Exception as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":

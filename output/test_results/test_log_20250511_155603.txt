@@ -1,0 +1,47 @@
+2025-05-11 15:56:03,679 - __main__ - INFO - Starting comprehensive test with KML file: kml/Test territoire.kml
+2025-05-11 15:56:03,679 - __main__ - INFO - Test results will be saved to: output/test_results
+2025-05-11 15:56:03,683 - __main__ - INFO - Test 1: Basic conversion without optimization
+2025-05-11 15:56:03,686 - __main__ - INFO - Basic conversion successful:
+2025-05-11 15:56:03,688 - __main__ - INFO -   - Time: 0.00 seconds
+2025-05-11 15:56:03,690 - __main__ - INFO -   - Features: 1
+2025-05-11 15:56:03,690 - __main__ - INFO -   - Vertices: 7
+2025-05-11 15:56:03,690 - __main__ - INFO -   - File size: 1.50 KB
+2025-05-11 15:56:03,701 - __main__ - INFO -   - Output: output/test_results\basic_conversion_20250511_155603.svg
+2025-05-11 15:56:03,701 - __main__ - INFO - 
+Test 2: Optimized conversion
+2025-05-11 15:56:03,710 - __main__ - INFO - Optimized conversion successful:
+2025-05-11 15:56:03,710 - __main__ - INFO -   - Time: 0.01 seconds
+2025-05-11 15:56:03,710 - __main__ - INFO -   - Features: 1
+2025-05-11 15:56:03,710 - __main__ - INFO -   - Vertices: 7
+2025-05-11 15:56:03,712 - __main__ - INFO -   - File size: 1.50 KB
+2025-05-11 15:56:03,712 - __main__ - INFO -   - Output: output/test_results\optimized_conversion_20250511_155603.svg
+2025-05-11 15:56:03,712 - __main__ - INFO - Improvements:
+2025-05-11 15:56:03,712 - __main__ - INFO -   - Processing time: -155.19% faster
+2025-05-11 15:56:03,712 - __main__ - INFO -   - Vertex count: 0.00% reduction
+2025-05-11 15:56:03,712 - __main__ - INFO -   - File size: 0.00% smaller
+2025-05-11 15:56:03,713 - __main__ - INFO - 
+Test 3: Aggressive optimization
+2025-05-11 15:56:03,717 - __main__ - INFO - Aggressive optimization successful:
+2025-05-11 15:56:03,717 - __main__ - INFO -   - Time: 0.00 seconds
+2025-05-11 15:56:03,717 - __main__ - INFO -   - Features: 1
+2025-05-11 15:56:03,717 - __main__ - INFO -   - Vertices: 7
+2025-05-11 15:56:03,717 - __main__ - INFO -   - File size: 1.50 KB
+2025-05-11 15:56:03,717 - __main__ - INFO -   - Output: output/test_results\aggressive_optimization_20250511_155603.svg
+2025-05-11 15:56:03,717 - __main__ - INFO - Improvements vs. basic:
+2025-05-11 15:56:03,717 - __main__ - INFO -   - Processing time: -9.89% faster
+2025-05-11 15:56:03,717 - __main__ - INFO -   - Vertex count: 0.00% reduction
+2025-05-11 15:56:03,717 - __main__ - INFO -   - File size: 0.00% smaller
+2025-05-11 15:56:03,717 - __main__ - INFO - 
+Test 4: Full map with OSM data
+2025-05-11 15:56:03,717 - __main__ - INFO - Downloading or retrieving cached OSM data...
+2025-05-11 15:56:05,745 - __main__ - INFO - Full map with OSM data successful:
+2025-05-11 15:56:05,745 - __main__ - INFO -   - Time: 2.03 seconds
+2025-05-11 15:56:05,745 - __main__ - INFO -   - Features: 1
+2025-05-11 15:56:05,745 - __main__ - INFO -   - File size: 181.00 KB
+2025-05-11 15:56:05,745 - __main__ - INFO -   - Output: output/test_results\full_map_20250511_155603.svg
+2025-05-11 15:56:05,745 - __main__ - INFO - 
+Test 5: Error handling (intentional errors)
+2025-05-11 15:56:05,766 - __main__ - INFO - Error handling test (invalid KML): Passed
+2025-05-11 15:56:05,778 - __main__ - INFO - Error handling test (no boundary): Passed
+2025-05-11 15:56:05,789 - __main__ - INFO - 
+Test report saved to: output/test_results\test_report_20250511_155603.txt
