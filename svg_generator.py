@@ -70,15 +70,13 @@ def create_svg_map(osm_data, boundary_coords, output_file, svg_width=None, svg_h
     add_background_pattern(dwg, background_group, svg_width, svg_height)
     
     # Initialize set to track added street names
-    added_names = set()
-    # Track label positions to prevent overlaps
+    added_names = set()    # Track label positions to prevent overlaps
     used_label_areas = []
     
-    # Draw boundary if debug mode is on
-    if debug_bounds:
-        draw_boundary(dwg, background_group, boundary_coords, bbox, svg_width, svg_height)
+    # Always draw the boundary as a thin grey line
+    draw_boundary(dwg, background_group, boundary_coords, bbox, svg_width, svg_height)
     
-    # Process KML features if available
+    # Process KML features if available (now just gets the boundary)
     if kml_features:
         process_kml_features(dwg, kml_group, kml_features, kml_styles, boundary_coords, bbox, 
                             svg_width, svg_height, text_group, used_label_areas, skip_labels)
@@ -116,7 +114,7 @@ def add_background_pattern(dwg, group, width, height):
     group.add(dwg.rect((0, 0), (width, height), fill='url(#bg_pattern)'))
 
 def draw_boundary(dwg, group, boundary_coords, bbox, svg_width, svg_height):
-    """Draw the boundary polygon for debugging"""
+    """Draw the boundary polygon as a thin grey line"""
     svg_points = transform_coordinates(boundary_coords, bbox, svg_width, svg_height)
     
     # Create boundary path
@@ -127,62 +125,24 @@ def draw_boundary(dwg, group, boundary_coords, bbox, svg_width, svg_height):
     
     path = dwg.path(d=poly_path)
     path['fill'] = 'none'
-    path['stroke'] = '#FF0000'
-    path['stroke-width'] = 2
-    path['stroke-dasharray'] = '5,5'
+    path['stroke'] = '#999999'  # Grey color
+    path['stroke-width'] = 1    # Thin line
     group.add(path)
 
 def process_kml_features(dwg, kml_group, kml_features, kml_styles, boundary_coords, bbox, 
                         svg_width, svg_height, text_group, used_label_areas, skip_labels):
-    """Process and render KML features"""
-    logger.info(f"Processing {len(kml_features)} KML features")
+    """Process and render KML features - modified to only show outlines without content"""
+    logger.info(f"Processing KML features (outlines only)")
     
     # Create subgroups for different feature types
     polygon_group = dwg.g(id='kml-polygons')
     line_group = dwg.g(id='kml-lines')
     point_group = dwg.g(id='kml-points')
     
-    # Transform all features to SVG coordinates
-    for feature in kml_features:
-        transformed_feature = transform_feature(feature, bbox, svg_width, svg_height)
-        
-        # Get style for the feature
-        style = get_feature_style(transformed_feature, kml_styles, True)
-        if not style:
-            continue
-        
-        feature_type = transformed_feature['type']
-        
-        if feature_type == 'Polygon':
-            render_polygon(dwg, polygon_group, transformed_feature, style)
-            
-            # Add label if available and labels aren't skipped
-            if not skip_labels and 'name' in transformed_feature and transformed_feature['name']:
-                add_feature_label(dwg, text_group, transformed_feature, used_label_areas)
-        
-        elif feature_type == 'LineString':
-            render_linestring(dwg, line_group, transformed_feature, style)
-            
-            # Add label if available and labels aren't skipped
-            if not skip_labels and 'name' in transformed_feature and transformed_feature['name']:
-                add_feature_label(dwg, text_group, transformed_feature, used_label_areas)
-        
-        elif feature_type == 'Point':
-            render_point(dwg, point_group, transformed_feature, style)
-            
-            # Add label if available and labels aren't skipped
-            if not skip_labels and 'name' in transformed_feature and transformed_feature['name']:
-                add_point_label(dwg, text_group, transformed_feature, used_label_areas)
-        
-        elif feature_type == 'MultiGeometry':
-            render_multigeometry(dwg, polygon_group, line_group, point_group,
-                                transformed_feature, style)
-            
-            # Add label if available and labels aren't skipped
-            if not skip_labels and 'name' in transformed_feature and transformed_feature['name']:
-                add_feature_label(dwg, text_group, transformed_feature, used_label_areas)
+    # We'll only add the boundary polygon as a thin grey line
+    # The actual KML features won't be rendered
     
-    # Add subgroups to main KML group
+    # Add subgroups to main KML group (they'll be empty but kept for structure)
     kml_group.add(polygon_group)
     kml_group.add(line_group)
     kml_group.add(point_group)

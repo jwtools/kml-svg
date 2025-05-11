@@ -107,9 +107,9 @@ def get_way_style(tags, is_inside=True):
     elif any(tag in tags for tag in ["leisure", "landuse", "natural"]):
         if tags.get("landuse") in ["allotment", "allotments"]:  # Handle both singular and plural
             base_style = {
-                "fill": "#E8F4D9",  # Pale green for allotments
-                "stroke": "#76A32D",  # Darker, more visible contour
-                "stroke-width": 2,    # Thicker border
+                "fill": "#E8F4D9",    # Pale green for allotments
+                "stroke": "none",      # No border
+                "stroke-width": 0,    # Zero border width
                 "opacity": 0.9,       # Increased opacity
                 "type": "polygon"
             }
