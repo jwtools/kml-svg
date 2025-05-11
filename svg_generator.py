@@ -584,19 +584,81 @@ def process_osm_data(dwg, osm_data, boundary_coords, bbox, svg_width, svg_height
 def add_road_labels(dwg, roads_by_name, boundary_coords, bbox, svg_width, svg_height, 
                     text_group, added_names, used_label_areas):
     """Add labels for roads"""
-    from shapely.geometry import Polygon, LineString
-    from shapely.ops import linemerge
+    from shapely.geometry import Polygon, LineString, MultiLineString, Point
+    from shapely.ops import linemerge, unary_union, nearest_points
     
     for road_name, road_data in roads_by_name.items():
         if not road_data['segments']:
             continue
         
-        # Merge all segments (not just inside ones)
+        # Merge all segments with the same name
         all_lines = [LineString(seg) for seg in road_data['segments'] if len(seg) > 1]
         if not all_lines:
             continue
-        
+            
+        # Improved segment merging:
+        # 1. First try to merge all segments with the same name into a single geometry
+        # 2. For disconnected segments, check if they're close enough to be treated as one road
         merged = linemerge(all_lines)
+        
+        # If we have multiple non-connected lines, check if they're part of the same road
+        # but just have a small gap between them
+        if merged.geom_type == 'MultiLineString' and len(list(merged.geoms)) > 1:
+            connect_threshold = 0.0005  # Maximum distance to connect segments (in degrees)
+            new_lines = list(merged.geoms)
+            
+            # Sort lines by length (descending) to merge smaller segments into the longest ones first
+            new_lines.sort(key=lambda line: line.length, reverse=True)
+            
+            merged_lines = []
+            remaining_lines = new_lines.copy()
+            
+            # Start with the longest segment
+            current_line = remaining_lines.pop(0)
+            merged_lines.append(current_line)
+            
+            # Keep trying to merge until no more merges are possible
+            while remaining_lines:
+                closest_idx = -1
+                min_distance = float('inf')
+                
+                # Find the closest remaining line to our current line
+                for i, line in enumerate(remaining_lines):
+                    # Get closest points between the current merged line and this line
+                    p1, p2 = nearest_points(current_line, line)
+                    dist = p1.distance(p2)
+                    
+                    if dist < min_distance:
+                        min_distance = dist
+                        closest_idx = i
+                
+                # If we found a close enough segment, merge it
+                if min_distance < connect_threshold:
+                    next_line = remaining_lines.pop(closest_idx)
+                    # Create a new merged line
+                    current_line = linemerge([current_line, next_line])
+                    
+                    # If merging didn't work (due to topology), just add as separate line
+                    if current_line.geom_type == 'MultiLineString':
+                        merged_lines[-1] = list(current_line.geoms)[0]  # Replace with first part
+                        merged_lines.extend(list(current_line.geoms)[1:])  # Add other parts
+                        
+                        # Continue with the longest remaining merged segment
+                        current_line = max(merged_lines, key=lambda line: line.length)
+                    else:
+                        # Replace the last merged line with the new merged line
+                        merged_lines[-1] = current_line
+                else:
+                    # If no close segments, start a new merge group with the longest remaining
+                    if remaining_lines:
+                        current_line = remaining_lines.pop(0)
+                        merged_lines.append(current_line)
+            
+            # Create a new MultiLineString from our merged segments
+            if len(merged_lines) == 1:
+                merged = merged_lines[0]
+            else:
+                merged = MultiLineString(merged_lines)
         
         # Clip to boundary with a buffer to ensure roads that touch the boundary are included
         boundary_poly = Polygon(boundary_coords).buffer(0.0005)  # Add small buffer
@@ -607,72 +669,84 @@ def add_road_labels(dwg, roads_by_name, boundary_coords, bbox, svg_width, svg_he
             'footway', 'path', 'pedestrian', 'service', 'track', 'living_street'
         ]
         is_residential = 'highway' in road_data['tags'] and road_data['tags']['highway'] == 'residential'
-        
+          # Choose different labeling strategy based on road type and geometry
         if merged.geom_type == 'MultiLineString':
-            # Instead of taking just the longest segment, try to label each major segment
             segments_to_label = []
-            for line in merged.geoms:
-                # Use appropriate thresholds for different road types
-                if is_residential:
-                    # Even lower threshold for residential roads (crucial for navigation)
-                    length_threshold = 0.0001
-                elif is_small_road:
-                    # Small threshold for minor roads and paths
-                    length_threshold = 0.0002
-                else:
-                    # Default threshold for major roads
-                    length_threshold = 0.0005
-                
+            
+            # Define appropriate length thresholds based on road type
+            if is_residential:
+                length_threshold = 0.0001  # Lower threshold for residential roads
+            elif is_small_road:
+                length_threshold = 0.0002  # Small threshold for minor roads
+            else:
+                length_threshold = 0.0005  # Default threshold for major roads
+            
+            # Sort segments by length, largest first
+            sorted_segments = sorted(merged.geoms, key=lambda line: line.length, reverse=True)
+            
+            # For roads with multiple segments, try to label each significant segment
+            # but avoid too many labels on the same road
+            for line in sorted_segments:
                 if line.length > length_threshold:
                     clipped = line.intersection(boundary_poly)
                     if not clipped.is_empty and clipped.length > 0:
                         segments_to_label.append(clipped)
+            
+            # Limit the number of segments to label based on road type
+            if not is_residential and not is_small_road:
+                # For major roads, limit to 2 labels if there are many segments
+                if len(segments_to_label) > 2:
+                    segments_to_label = segments_to_label[:2]
         else:
+            # Single contiguous road
             clipped = merged.intersection(boundary_poly)
             if not clipped.is_empty and clipped.length > 0:
                 segments_to_label = [clipped]
         
         if not segments_to_label:
             continue
-            
-        # Try to label each segment
+              # Try to label each segment
         for i, clipped in enumerate(segments_to_label):
             if clipped.is_empty or clipped.length == 0:
-                continue            # Handle duplicate labels for road segments intelligently
-            # For paths and small roads, we should be less restrictive to ensure they're labeled
+                continue
+
+            # Special case handling for different road types
             is_small_road = 'highway' in road_data['tags'] and road_data['tags']['highway'] in [
                 'footway', 'path', 'pedestrian', 'service', 'track', 'living_street'
             ]
             is_residential = 'highway' in road_data['tags'] and road_data['tags']['highway'] == 'residential'
             
-            # If we've already labeled this road
+            # If we've already labeled this road, apply distance rules
             if road_name in added_names:
-                # Special case for residential roads - they're important and should be labeled
+                # For residential roads - important for navigation
                 if is_residential:
-                    # Always allow the first segment for residential roads
+                    # Always label the first segment
                     if i == 0:
                         pass  # Continue with label placement
+                    # For subsequent segments, check distance is sufficient
                     else:
-                        # For subsequent segments, check distance
+                        # Calculate distance between this and previously labeled segments
                         prev_centers = []
                         for prev_clip in segments_to_label[:i]:
+                            # Get the center of the previous segment
                             prev_center = list(prev_clip.interpolate(0.5, normalized=True).coords)[0]
                             prev_x, prev_y = lat_lon_to_xy(prev_center[1], prev_center[0], bbox, svg_width, svg_height)
                             prev_centers.append((prev_x, prev_y))
                         
+                        # Calculate center of current segment
                         curr_center = list(clipped.interpolate(0.5, normalized=True).coords)[0]
                         curr_x, curr_y = lat_lon_to_xy(curr_center[1], curr_center[0], bbox, svg_width, svg_height)
                         
-                        # More lenient distance for residential roads (only 15% of map width)
+                        # Make sure labels are far enough apart (15% of map width for residential)
                         min_distance = min(((curr_x - x)**2 + (curr_y - y)**2)**0.5 for x, y in prev_centers) if prev_centers else float('inf')
                         if min_distance < svg_width * 0.15:
                             continue
                 
-                # For small roads and paths (except residential which is handled above)
+                # For small roads (footways, paths, etc.)
                 elif is_small_road:
-                    # Only check distance for small roads with multiple segments
+                    # Only check distance for multiple segments
                     if i > 0:
-                        # Check distance from previous segments' centers
+                        # Check distance from previous segments
                         prev_centers = []
                         for prev_clip in segments_to_label[:i]:
                             prev_center = list(prev_clip.interpolate(0.5, normalized=True).coords)[0]
@@ -683,19 +757,20 @@ def add_road_labels(dwg, roads_by_name, boundary_coords, bbox, svg_width, svg_he
                         curr_center = list(clipped.interpolate(0.5, normalized=True).coords)[0]
                         curr_x, curr_y = lat_lon_to_xy(curr_center[1], curr_center[0], bbox, svg_width, svg_height)
                         
-                        # Skip if too close to an existing label of the same road
+                        # Skip if too close (20% of map width for small roads)
                         min_distance = min(((curr_x - x)**2 + (curr_y - y)**2)**0.5 for x, y in prev_centers) if prev_centers else float('inf')
-                        if min_distance < svg_width * 0.2:  # Allow closer labels for small roads (20% of map width)
+                        if min_distance < svg_width * 0.2:
                             continue
+                
+                # For major roads, be more restrictive to avoid cluttered labels
                 else:
-                    # For major roads, be more restrictive
-                    # Only allow multiple labels if:
-                    # 1. There are many segments (3+) AND
-                    # 2. This is not the second segment (i > 0)
+                    # Only allow multiple labels for major roads in specific cases:
+                    # 1. We have many segments (3+)
+                    # 2. This is not the second segment (avoid cluttering)
                     if i > 0 and len(segments_to_label) < 3:
                         continue
                     
-                    # Check distance from previous segments
+                    # For multiple labels, check they're far enough apart
                     prev_centers = []
                     for prev_clip in segments_to_label[:i]:
                         prev_center = list(prev_clip.interpolate(0.5, normalized=True).coords)[0]
@@ -706,115 +781,143 @@ def add_road_labels(dwg, roads_by_name, boundary_coords, bbox, svg_width, svg_he
                     curr_center = list(clipped.interpolate(0.5, normalized=True).coords)[0]
                     curr_x, curr_y = lat_lon_to_xy(curr_center[1], curr_center[0], bbox, svg_width, svg_height)
                     
-                    # Skip if too close to an existing label of the same road
+                    # Require 30% of map width between labels for major roads
                     min_distance = min(((curr_x - x)**2 + (curr_y - y)**2)**0.5 for x, y in prev_centers) if prev_centers else float('inf')
-                    if min_distance < svg_width * 0.3:  # Require at least 30% of map width between labels for major roads
+                    if min_distance < svg_width * 0.3:
                         continue
-                
-            # Find center point of clipped line
-            center_geo = list(clipped.interpolate(0.5, normalized=True).coords)[0]
-            center_x, center_y = lat_lon_to_xy(center_geo[1], center_geo[0], bbox, svg_width, svg_height)
-            
-            # Find angle at center
+                  # Find better center point by analyzing the segment geometry
             if clipped.geom_type == 'LineString':
+                # Get line coordinates in SVG space
                 svg_points = [lat_lon_to_xy(lat, lon, bbox, svg_width, svg_height) 
                              for lon, lat in clipped.coords]
-            else:
-                # Handle other geometry types if needed
-                continue
                 
-            min_dist = float('inf')
-            best_angle = 0
-            
-            for i in range(len(svg_points) - 1):
-                p1, p2 = svg_points[i], svg_points[i + 1]
-                proj = project_point_to_line((center_x, center_y), p1, p2)
-                dist = ((center_x - proj[0])**2 + (center_y - proj[1])**2)**0.5
-                if dist < min_dist:
-                    min_dist = dist
+                if len(svg_points) < 2:
+                    continue
+                
+                # Find the longest straight subsegment to place the label on
+                max_subsegment_length = 0
+                best_subsegment = None
+                
+                for i in range(len(svg_points) - 1):
+                    p1, p2 = svg_points[i], svg_points[i + 1]
+                    length = ((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)**0.5
+                    if length > max_subsegment_length:
+                        max_subsegment_length = length
+                        best_subsegment = (i, i + 1)
+                
+                # Calculate total length to determine center-point correctly
+                total_length = 0
+                segment_lengths = []
+                segment_starts = [0]
+                
+                for i in range(len(svg_points) - 1):
+                    p1, p2 = svg_points[i], svg_points[i + 1]
+                    length = ((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)**0.5
+                    total_length += length
+                    segment_lengths.append(length)
+                    segment_starts.append(total_length)
+                
+                # Get the best subsegment for label placement
+                if best_subsegment:
+                    idx1, idx2 = best_subsegment
+                    p1, p2 = svg_points[idx1], svg_points[idx2]
+                    
+                    # Calculate center point of best subsegment
+                    center_x = (p1[0] + p2[0]) / 2
+                    center_y = (p1[1] + p2[1]) / 2
+                    
+                    # Calculate angle for best subsegment
                     dx = p2[0] - p1[0]
                     dy = p2[1] - p1[1]
                     angle = math.degrees(math.atan2(dy, dx))
+                    
+                    # Normalize angle to be readable (avoid upside-down text)
                     if angle < -90 or angle > 90:
                         dx = -dx
                         dy = -dy
                         angle = math.degrees(math.atan2(dy, dx))
-                    best_angle = angle                # Small roads can have smaller text, but residential roads should be clearer
-                if is_residential:
-                    # Residential roads get full-size text but with a smaller buffer
-                    text_width = len(road_name) * 6
-                    text_height = 12
-                    font_size = '12px'
-                    buffer_distance = 12  # Very small buffer to ensure labels fit
-                elif is_small_road:
-                    # Other small roads get smaller text
-                    text_width = len(road_name) * 5.5  # Slightly smaller text width for small roads
-                    text_height = 11  # Slightly smaller text height
-                    font_size = '11px'  # Smaller font size
-                    buffer_distance = 15  # Small buffer distance
+                    
+                    best_angle = angle
                 else:
-                    # Major roads
-                    text_width = len(road_name) * 6
-                    text_height = 12
-                    font_size = '12px'
-                    buffer_distance = 20  # Standard buffer distance            # Try multiple positions along the road if center position has collision
-            # More granular positions to try for better label placement
-            positions_to_try = [0.5, 0.45, 0.55, 0.4, 0.6, 0.35, 0.65, 0.3, 0.7, 0.25, 0.75, 0.2, 0.8]
-            
-            # Additional positions for special road types
+                    # Fallback to simple center if no good subsegment
+                    center_point = list(clipped.interpolate(0.5, normalized=True).coords)[0]
+                    center_x, center_y = lat_lon_to_xy(center_point[1], center_point[0], bbox, svg_width, svg_height)
+                    best_angle = 0
+            else:
+                # Fallback for non-LineString geometries
+                center_point = list(clipped.interpolate(0.5, normalized=True).coords)[0]
+                center_x, center_y = lat_lon_to_xy(center_point[1], center_point[0], bbox, svg_width, svg_height)
+                best_angle = 0            # Set appropriate text styles based on road type
             if is_residential:
-                # Residential roads get even more positioning options to ensure they're labeled
-                positions_to_try.extend([0.15, 0.85, 0.1, 0.9, 0.05, 0.95])
+                # Residential roads get full-size text with smaller buffer
+                text_width = len(road_name) * 6
+                text_height = 12
+                font_size = '12px'
+                buffer_distance = 12  # Very small buffer to ensure labels fit
             elif is_small_road:
-                # Small roads/paths get additional positioning options
-                positions_to_try.extend([0.15, 0.85, 0.1, 0.9])  # Try more extreme positions for small roads
-                
+                # Other small roads get smaller text
+                text_width = len(road_name) * 5.5
+                text_height = 11
+                font_size = '11px'
+                buffer_distance = 15  # Small buffer distance
+            else:
+                # Major roads
+                text_width = len(road_name) * 6
+                text_height = 12
+                font_size = '12px'
+                buffer_distance = 20  # Standard buffer distance
+            
+            # --- OSM-style label clarity improvements ---
+            # Always center the label on the best segment, with a white outline and clear font
             found_position = False
-            for pos in positions_to_try:
-                if found_position:
-                    break
-                
-                alt_center_geo = list(clipped.interpolate(pos, normalized=True).coords)[0]
-                alt_center_x, alt_center_y = lat_lon_to_xy(alt_center_geo[1], alt_center_geo[0], 
-                                                          bbox, svg_width, svg_height)
-                
-                if not check_label_collision(alt_center_x, alt_center_y, text_width, text_height, best_angle, used_label_areas, buffer_distance)[0]:
-                    text = dwg.text(road_name)
-                    text['x'] = alt_center_x
-                    text['y'] = alt_center_y
-                    text['font-family'] = 'Arial, sans-serif'
-                    text['font-size'] = font_size
-                    text['text-anchor'] = 'middle'
-                    text['fill'] = '#333333'
-                    if best_angle != 0:
-                        text['transform'] = f'rotate({best_angle} {alt_center_x} {alt_center_y})'
-                    
-                    # Add white outline/background for better readability
-                    bg = dwg.text(road_name)
-                    bg['x'] = alt_center_x
-                    bg['y'] = alt_center_y
-                    bg['font-family'] = 'Arial, sans-serif'
-                    bg['font-size'] = font_size
-                    bg['text-anchor'] = 'middle'
-                    bg['fill'] = 'none'
-                    bg['stroke'] = 'white'                    
-                    bg['stroke-width'] = 3
-                    bg['stroke-linecap'] = 'round'
-                    bg['stroke-linejoin'] = 'round'
-                    if best_angle != 0:
-                        bg['transform'] = f'rotate({best_angle} {alt_center_x} {alt_center_y})'
-                    
-                    text_group.add(bg)
-                    text_group.add(text)
-                    
-                    # Keep track of label areas to prevent overlaps
-                    corners = calculate_label_corners(alt_center_x, alt_center_y, 
-                                                   text_width, text_height, best_angle)
-                    used_label_areas.append(Polygon(corners))
-                    
-                    # Mark this road name as labeled
-                    added_names.add(road_name)
-                    
-                    # Set the flag to exit the position loop
-                    found_position = True
-                    break  # Found a good position, stop trying positions
+            best_x, best_y = center_x, center_y  # Default to center
+            # Only use the best position (center of best segment)
+            # Try to avoid overlap, but do not repeat the label unless the road is long
+            collision, (new_x, new_y) = check_label_collision(
+                center_x, center_y, text_width, text_height, best_angle, used_label_areas, buffer_distance
+            )
+            if not collision:
+                best_x, best_y = new_x, new_y
+                found_position = True
+            # If there is a collision, try a few offsets, but do not repeat label on every segment
+            else:
+                for dx, dy in [(0, -20), (0, 20), (-20, 0), (20, 0)]:
+                    collision, (alt_x, alt_y) = check_label_collision(
+                        center_x + dx, center_y + dy, text_width, text_height, best_angle, used_label_areas, buffer_distance
+                    )
+                    if not collision:
+                        best_x, best_y = alt_x, alt_y
+                        found_position = True
+                        break
+            # Render the label only once per road unless it's very long
+            if found_position:
+                # White outline (background)
+                bg = dwg.text(road_name)
+                bg['x'] = best_x
+                bg['y'] = best_y
+                bg['font-family'] = 'Arial, sans-serif'
+                bg['font-size'] = font_size
+                bg['text-anchor'] = 'middle'
+                bg['fill'] = 'none'
+                bg['stroke'] = 'white'
+                bg['stroke-width'] = 4
+                bg['stroke-linecap'] = 'round'
+                bg['stroke-linejoin'] = 'round'
+                if best_angle != 0:
+                    bg['transform'] = f'rotate({best_angle} {best_x} {best_y})'
+                text_group.add(bg)
+                # Foreground text
+                text = dwg.text(road_name)
+                text['x'] = best_x
+                text['y'] = best_y
+                text['font-family'] = 'Arial, sans-serif'
+                text['font-size'] = font_size
+                text['text-anchor'] = 'middle'
+                text['fill'] = '#333333'
+                if best_angle != 0:
+                    text['transform'] = f'rotate({best_angle} {best_x} {best_y})'
+                text_group.add(text)
+                # Track label area
+                corners = calculate_label_corners(best_x, best_y, text_width, text_height, best_angle)
+                used_label_areas.append(Polygon(corners))
+                added_names.add(road_name)
