@@ -1,0 +1,1 @@
+with open("svg_generator.py", "r") as f:\n    content = f.read()\n\ncontent = content.replace("# Collect info about this segment        suitable_segments.append({", "# Collect info about this segment\\n        suitable_segments.append({")\n\nwith open("svg_generator.py", "w") as f:\n    f.write(content)
